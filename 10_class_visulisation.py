@@ -253,7 +253,7 @@ def main():
     )
 
     plot_embedding(embeddings_2d, labels, args.hash_method, args.use_tsne)
-    plt.savefig(f"results/{args.hash_method}_{args.distance_metric}_{'tsne' if args.use_tsne else 'pca'}_visualization.png", dpi=300)
+    plt.savefig(f"results/10_class_visulisation/{args.hash_method}_{args.distance_metric}_{'tsne' if args.use_tsne else 'pca'}_visualization.png", dpi=300)
     plt.show()
 
     compute_distance_analysis(
