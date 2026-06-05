@@ -24,6 +24,7 @@ DEFAULT_MODEL = ROOT / "CertPhash" / "train_verify" / "saved_models" / "coco_pho
 DEFAULT_IMAGE_DIR = ROOT / "CertPhash" / "train_verify" / "data" / "coco100x100_val"
 DEFAULT_OUTPUT_DIR = ROOT / "my_work" / "results" / "certphash_collider"
 DEFAULT_TENSORBOARD_DIR = ROOT / "my_work" / "results" / "tensorboard" / "certphash_collider"
+DEFAULT_MODEL_INPUT_SIZE = 64
 IMAGE_EXTENSIONS = {".bmp", ".jpeg", ".jpg", ".png", ".webp"}
 
 sys.path.insert(0, str(CERTPHASH_ATTACK))
@@ -65,6 +66,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Where outputs are saved.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed for image sampling and torch.")
     parser.add_argument("--device", type=str, default="auto", help="auto, cpu, cuda, or cuda:0.")
+    parser.add_argument("--optimize-size", choices=["model", "original"], default="model", help="Optimize the 64x64 model input or the original-resolution image.")
+    parser.add_argument("--model-input-size", type=int, default=DEFAULT_MODEL_INPUT_SIZE, help="CertPHash model input size used before the network.")
     parser.add_argument("--steps", type=int, default=3000, help="Optimization steps.")
     parser.add_argument("--lr", type=float, default=1e-2, help="Adam learning rate for the image perturbation.")
     parser.add_argument("--epsilon", type=float, default=16.0 / 255.0, help="L-infinity perturbation budget in [0, 1].")
@@ -130,8 +133,10 @@ def pick_source_and_target(args: argparse.Namespace) -> tuple[Path, Path]:
     return source, target
 
 
-def load_image(path: Path, device: torch.device, image_size: int = 64) -> torch.Tensor:
-    image = Image.open(path).convert("RGB").resize((image_size, image_size), Image.BILINEAR)
+def load_image(path: Path, device: torch.device, image_size: int | None = DEFAULT_MODEL_INPUT_SIZE) -> torch.Tensor:
+    image = Image.open(path).convert("RGB")
+    if image_size is not None:
+        image = image.resize((image_size, image_size), Image.BILINEAR)
     array = np.asarray(image, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).unsqueeze(0)
     return tensor.to(device)
@@ -150,7 +155,15 @@ def tensor_to_uint8_image(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(image)
 
 
+def resize_tensor(image: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
+    if image.shape[-2:] == size:
+        return image
+    return F.interpolate(image, size=size, mode="bilinear", align_corners=False)
+
+
 def save_comparison(source: torch.Tensor, target: torch.Tensor, adv: torch.Tensor, path: Path) -> None:
+    target = resize_tensor(target, source.shape[-2:])
+    adv = resize_tensor(adv, source.shape[-2:])
     delta_visual = delta_to_visual(adv - source)
     panels = [
         tensor_to_uint8_image(source),
@@ -181,6 +194,8 @@ def delta_to_visual(delta: torch.Tensor) -> torch.Tensor:
 
 
 def comparison_tensor(source: torch.Tensor, target: torch.Tensor, adv: torch.Tensor) -> torch.Tensor:
+    target = resize_tensor(target, source.shape[-2:])
+    adv = resize_tensor(adv, source.shape[-2:])
     panels = [
         source.detach().cpu().clamp(0.0, 1.0),
         target.detach().cpu().clamp(0.0, 1.0),
@@ -194,6 +209,19 @@ def normalize_coco(image: torch.Tensor) -> torch.Tensor:
     mean = torch.tensor([0.485, 0.456, 0.406], device=image.device).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=image.device).view(1, 3, 1, 1)
     return (image - mean) / std
+
+
+def resize_for_certphash(image: torch.Tensor, model_input_size: int = DEFAULT_MODEL_INPUT_SIZE) -> torch.Tensor:
+    return resize_tensor(image, (model_input_size, model_input_size))
+
+
+def certphash_logits(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    model_input_size: int = DEFAULT_MODEL_INPUT_SIZE,
+) -> torch.Tensor:
+    image_for_model = resize_for_certphash(image, model_input_size)
+    return model(normalize_coco(image_for_model))
 
 
 def load_model(model_path: Path, device: torch.device) -> torch.nn.Module:
@@ -232,8 +260,12 @@ def hash_from_quantized(quantized: torch.Tensor) -> HashResult:
 
 
 @torch.no_grad()
-def certphash(model: torch.nn.Module, image: torch.Tensor) -> tuple[torch.Tensor, HashResult]:
-    logits = model(normalize_coco(image))
+def certphash(
+    model: torch.nn.Module,
+    image: torch.Tensor,
+    model_input_size: int = DEFAULT_MODEL_INPUT_SIZE,
+) -> tuple[torch.Tensor, HashResult]:
+    logits = certphash_logits(model, image, model_input_size)
     quantized = quantize_logits(logits)
     return quantized, hash_from_quantized(quantized)
 
@@ -276,9 +308,10 @@ def measure(
     target_loss: float,
     source_l1: float,
     target_image_l1: float,
+    model_input_size: int = DEFAULT_MODEL_INPUT_SIZE,
 ) -> AttackMetrics:
     with torch.no_grad():
-        logits = model(normalize_coco(adv))
+        logits = certphash_logits(model, adv, model_input_size)
         current_quantized = quantize_logits(logits)
         byte_l1, bit_hamming = hash_distances(current_quantized, target_quantized, target_hash)
         diff = adv - source
@@ -334,6 +367,7 @@ def maybe_shrink(
             math.nan,
             math.nan,
             math.nan,
+            args.model_input_size,
         )
         if is_success(metrics, args):
             best = candidate.detach().clone()
@@ -368,13 +402,13 @@ def run_hash_report(args: argparse.Namespace) -> None:
     reference_quantized = None
     reference_hash = None
     if reference_path is not None:
-        reference_image = load_image(reference_path, device)
-        reference_quantized, reference_hash = certphash(model, reference_image)
+        reference_image = load_image(reference_path, device, image_size=None)
+        reference_quantized, reference_hash = certphash(model, reference_image, args.model_input_size)
 
     rows = []
     for image_path in images:
-        image = load_image(image_path, device)
-        quantized, image_hash = certphash(model, image)
+        image = load_image(image_path, device, image_size=None)
+        quantized, image_hash = certphash(model, image, args.model_input_size)
         row = {
             "image": str(image_path),
             "hash_base64": image_hash.base64,
@@ -419,13 +453,15 @@ def run_attack(args: argparse.Namespace) -> None:
     print(f"Model: {args.model}")
 
     model = load_model(args.model, device)
-    source = load_image(source_path, device)
-    target = load_image(target_path, device)
+    image_size = None if args.optimize_size == "original" else args.model_input_size
+    source = load_image(source_path, device, image_size=image_size)
+    target = load_image(target_path, device, image_size=image_size)
+    target_for_pixels = resize_tensor(target, source.shape[-2:])
     writer: SummaryWriter | None = None
 
     with torch.no_grad():
-        source_quantized, source_hash = certphash(model, source)
-        target_quantized, target_hash = certphash(model, target)
+        source_quantized, source_hash = certphash(model, source, args.model_input_size)
+        target_quantized, target_hash = certphash(model, target, args.model_input_size)
 
     print(f"Initial source hash base64: {source_hash.base64}")
     print(f"Target hash base64:         {target_hash.base64}")
@@ -466,6 +502,8 @@ def run_attack(args: argparse.Namespace) -> None:
                 "hash_loss": args.hash_loss,
                 "smooth_l1_beta": args.smooth_l1_beta,
                 "hash_scale": args.hash_scale,
+                "optimize_size": args.optimize_size,
+                "model_input_size": args.model_input_size,
             },
             {},
         )
@@ -474,10 +512,10 @@ def run_attack(args: argparse.Namespace) -> None:
     try:
         for step in range(1, args.steps + 1):
             adv = torch.clamp(source + delta, 0.0, 1.0)
-            logits = model(normalize_coco(adv))
+            logits = certphash_logits(model, adv, args.model_input_size)
             target_loss = hash_target_loss(logits, target_quantized, args)
             source_l1 = F.l1_loss(adv, source)
-            target_image_l1 = F.l1_loss(adv, target)
+            target_image_l1 = F.l1_loss(adv, target_for_pixels)
             tv_loss = total_variation(adv) if args.tv_weight > 0 else torch.zeros((), device=device)
             loss = target_loss + args.similarity_weight * source_l1 + args.target_image_weight * target_image_l1 + args.tv_weight * tv_loss
 
@@ -519,6 +557,7 @@ def run_attack(args: argparse.Namespace) -> None:
                 float(target_loss.detach().cpu()),
                 float(source_l1.detach().cpu()),
                 float(target_image_l1.detach().cpu()),
+                args.model_input_size,
             )
             if writer is not None:
                 writer.add_scalar("hash/byte_l1", metrics.byte_l1, step)
@@ -577,7 +616,7 @@ def run_attack(args: argparse.Namespace) -> None:
                     writer.add_image("images/adversarial_shrunk", best_adv.cpu().squeeze(0), args.steps)
                 print(f"Shrank successful perturbation to linf={shrink_metrics.linf:.5f}, l2={shrink_metrics.l2:.5f}.")
 
-        final_quantized, final_hash = certphash(model, best_adv)
+        final_quantized, final_hash = certphash(model, best_adv, args.model_input_size)
         final_byte_l1, final_bit_hamming = hash_distances(final_quantized, target_quantized, target_hash)
         final_diff = best_adv - source
         final_metrics = {
@@ -586,6 +625,10 @@ def run_attack(args: argparse.Namespace) -> None:
             "model": str(args.model),
             "device": str(device),
             "loss_objective": f"hash_{args.hash_loss}",
+            "optimize_size": args.optimize_size,
+            "source_tensor_shape": list(source.shape),
+            "target_tensor_shape": list(target.shape),
+            "model_input_size": args.model_input_size,
             "steps_requested": args.steps,
             "epsilon": None if args.unbounded else args.epsilon,
             "similarity_weight": args.similarity_weight,
