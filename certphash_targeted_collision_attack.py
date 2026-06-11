@@ -477,7 +477,9 @@ def run_attack(args: argparse.Namespace) -> None:
 
     if args.tensorboard:
         run_name = f"{source_path.stem}_to_{target_path.stem}_seed{args.seed}"
-        writer = SummaryWriter(log_dir=str(args.tb_dir / run_name))
+        tensorboard_log_dir = args.tb_dir / run_name
+        tensorboard_log_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tensorboard_log_dir))
         writer.add_text("paths/source", str(source_path), 0)
         writer.add_text("paths/target", str(target_path), 0)
         writer.add_text("paths/model", str(args.model), 0)
@@ -507,7 +509,7 @@ def run_attack(args: argparse.Namespace) -> None:
             },
             {},
         )
-        print(f"TensorBoard logs: {args.tb_dir / run_name}")
+        print(f"TensorBoard logs: {tensorboard_log_dir}")
 
     try:
         for step in range(1, args.steps + 1):
