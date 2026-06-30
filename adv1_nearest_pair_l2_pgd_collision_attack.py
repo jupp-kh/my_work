@@ -40,6 +40,13 @@ def parse_positive_floats(value: str) -> list[float]:
     return values
 
 
+def parse_nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Value must be non-negative.")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -68,7 +75,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--check-interval", type=int, default=1)
     parser.add_argument("--threshold", type=float, default=1800.0)
-    parser.add_argument("--random-start", action="store_true", help="Start from a random point inside the L2 ball.")
+    parser.add_argument(
+        "--linf-penalty-weight",
+        type=parse_nonnegative_float,
+        default=0.0,
+        help="Weight for the capped L-infinity perturbation penalty in the PGD loss.",
+    )
+    parser.add_argument(
+        "--linf-cap",
+        type=parse_nonnegative_float,
+        default=0.10,
+        help="L-infinity perturbation value allowed before the squared penalty activates.",
+    )
+    parser.add_argument("--random-start", action="store_true", help="Start from a random feasible perturbation.")
     parser.add_argument("--save-examples", type=int, default=0, help="0 saves no PNGs, -1 saves every success.")
     parser.add_argument("--disable-progress", action="store_true")
     parser.add_argument("--shuffle", action="store_true", help="Shuffle CSV rows before applying --sample-limit.")
@@ -153,13 +172,20 @@ def project_l2_ball(delta: torch.Tensor, epsilon: float) -> torch.Tensor:
     return delta * scale.view(-1, 1, 1, 1)
 
 
-def random_l2_delta(source: torch.Tensor, epsilon: float) -> torch.Tensor:
+def project_feasible_delta(source: torch.Tensor, delta: torch.Tensor, l2_epsilon: float, linf_cap: float) -> torch.Tensor:
+    delta = delta.clamp(-linf_cap, linf_cap)
+    delta = project_l2_ball(delta, l2_epsilon)
+    delta = (source + delta).clamp(0.0, 1.0) - source
+    delta = delta.clamp(-linf_cap, linf_cap)
+    return project_l2_ball(delta, l2_epsilon)
+
+
+def random_feasible_delta(source: torch.Tensor, l2_epsilon: float, linf_cap: float) -> torch.Tensor:
     delta = torch.randn_like(source)
     delta = project_l2_ball(delta, 1.0)
     radius = torch.rand(source.shape[0], device=source.device).view(-1, 1, 1, 1)
-    delta = delta * radius * epsilon
-    delta = (source + delta).clamp(0.0, 1.0) - source
-    return project_l2_ball(delta, epsilon)
+    delta = delta * radius * l2_epsilon
+    return project_feasible_delta(source, delta, l2_epsilon, linf_cap)
 
 
 def should_save_example(saved_count: int, save_examples: int) -> bool:
@@ -182,11 +208,12 @@ def attack_pair(
     source_orig = source.clone()
 
     with torch.no_grad():
-        target_hash = rounded_hash(model, target)
+        target_outputs = model(normalize(target, "coco"))
+        target_hash = torch.relu(torch.round(target_outputs))
         initial_hash_l1 = hash_l1(model, source, target_hash)
 
     if args.random_start:
-        delta = random_l2_delta(source, l2_epsilon).detach().requires_grad_(True)
+        delta = random_feasible_delta(source, l2_epsilon, args.linf_cap).detach().requires_grad_(True)
     else:
         delta = torch.zeros_like(source, requires_grad=True)
 
@@ -194,15 +221,16 @@ def attack_pair(
     final_step = args.steps
     final_hash_l1 = initial_hash_l1
     success = False
-    current_img = source_orig
 
     iterator = tqdm(range(args.steps), disable=args.disable_progress, leave=False)
     for step in iterator:
         current_img = source + delta
         outputs_source = model(normalize(current_img, "coco"))
-        target_loss = mse_loss(outputs_source, target_hash)
-
-        target_loss.backward()
+        target_loss = mse_loss(outputs_source, target_outputs)
+        linf = torch.amax(delta.abs().flatten(start_dim=1), dim=1).mean()
+        linf_penalty = torch.relu(linf - args.linf_cap) ** 2
+        total_loss = target_loss + args.linf_penalty_weight * linf_penalty
+        total_loss.backward()
 
         with torch.no_grad():
             grad = delta.grad
@@ -210,9 +238,7 @@ def attack_pair(
             normalized_grad = grad / grad_norm.view(-1, 1, 1, 1)
 
             delta.sub_(pgd_step_size * normalized_grad)
-            delta.copy_(project_l2_ball(delta, l2_epsilon))
-            delta.copy_((source + delta).clamp(0.0, 1.0) - source)
-            delta.copy_(project_l2_ball(delta, l2_epsilon))
+            delta.copy_(project_feasible_delta(source, delta, l2_epsilon, args.linf_cap))
             delta.grad.zero_()
 
         if step % args.check_interval != 0:
@@ -225,7 +251,7 @@ def attack_pair(
                 final_step = step + 1
                 success = True
                 break
-
+        print(f"{step}: loss={total_loss.item():.2f}, hash_l1={final_hash_l1:.2f}, l2_norm={torch.norm(delta).item():.2f}, linf_max={delta.abs().max().item():.2f}, grad_norm={grad_norm.mean().item():.2f}"  )
     with torch.no_grad():
         current_img = (source + delta).clamp(0.0, 1.0)
         diff = current_img - source_orig
@@ -242,6 +268,8 @@ def attack_pair(
         "final_hash_l1": final_hash_l1,
         "l2_budget": l2_epsilon,
         "pgd_step_size": pgd_step_size,
+        "linf_penalty_weight": args.linf_penalty_weight,
+        "linf_cap": args.linf_cap,
         "l2": l2_distance,
         "l_inf": linf_distance,
         "steps": final_step,
@@ -261,6 +289,8 @@ def write_results(results_path: Path, rows: list[dict[str, object]]) -> None:
         "tie_count",
         "l2_budget",
         "pgd_step_size",
+        "linf_penalty_weight",
+        "linf_cap",
         "success",
         "initial_hash_l1",
         "final_hash_l1",
@@ -298,6 +328,8 @@ def main() -> None:
     print(f"Model: {args.model_path}")
     print(f"L2 PGD budgets: {', '.join(f'{epsilon:g}' for epsilon in args.l2_epsilons)}")
     print(f"PGD step sizes: {', '.join(f'{step:g}' for step in args.pgd_step_size)}")
+    print(f"L-inf penalty weight: {args.linf_penalty_weight:g}")
+    print(f"L-inf penalty cap: {args.linf_cap:g}")
 
     saved_examples = 0
     for pgd_step_size in args.pgd_step_size:
@@ -332,6 +364,8 @@ def main() -> None:
                     "tie_count": pair.get("tie_count", ""),
                     "l2_budget": result["l2_budget"],
                     "pgd_step_size": result["pgd_step_size"],
+                    "linf_penalty_weight": result["linf_penalty_weight"],
+                    "linf_cap": result["linf_cap"],
                     "success": result["success"],
                     "initial_hash_l1": result["initial_hash_l1"],
                     "final_hash_l1": result["final_hash_l1"],
@@ -353,8 +387,14 @@ def main() -> None:
 
             step_label = format_float_label(pgd_step_size)
             budget_label = format_float_label(l2_epsilon)
+            penalty_suffix = ""
+            if args.linf_penalty_weight > 0:
+                penalty_label = format_float_label(args.linf_penalty_weight)
+                cap_label = format_float_label(args.linf_cap)
+                penalty_suffix = f"_linf_cap_{cap_label}_penalty_{penalty_label}"
             results_path = (
-                args.output_dir / f"nearest_pair_l2_pgd_step_{step_label}_budget_{budget_label}_collision_results.csv"
+                args.output_dir
+                / f"nearest_pair_l2_pgd_step_{step_label}_budget_{budget_label}{penalty_suffix}_collision_results.csv"
             )
             write_results(results_path, result_rows)
 

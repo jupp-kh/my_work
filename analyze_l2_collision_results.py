@@ -25,7 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-             default=Path("/results/adv1_nearest_pair_l2_pgd_collision/"),
+        default=None,
         help="Optional output directory. Default: <csv parent>/<csv stem>/",
     )
     parser.add_argument(
@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help="A row is counted as a collision only when l2 <= this value too. Defaults to l2_budget from the CSV.",
+    )
+    parser.add_argument(
+        "--successes",
+        action="store_true",
+        help="Use rows with success == True as the collision data and report means for those rows.",
     )
     parser.add_argument("--plot-points", type=int, default=PLOT_POINTS)
     return parser.parse_args()
@@ -124,6 +129,18 @@ def require_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.dropna(subset=required).reset_index(drop=True)
 
 
+def filter_success_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if "success" not in df.columns:
+        raise ValueError("--successes requires a success column in the CSV.")
+
+    success = df["success"]
+    if success.dtype == bool:
+        mask = success
+    else:
+        mask = success.astype(str).str.strip().str.lower().isin(["true", "1", "yes", "y"])
+    return df[mask].copy().reset_index(drop=True)
+
+
 def collision_rate(count: int, total: int) -> float:
     return 100.0 * count / total if total else 0.0
 
@@ -151,6 +168,7 @@ def make_summary(
     final_hash_l1_max: float,
     l_inf_max: float,
     l2_max: float,
+    collision_filter: str,
 ) -> pd.DataFrame:
     hash_collisions = df[df["final_hash_l1"] <= final_hash_l1_max]
     l_inf_filtered = hash_collisions[hash_collisions["l_inf"] <= l_inf_max]
@@ -161,6 +179,7 @@ def make_summary(
         "final_hash_l1_threshold": final_hash_l1_max,
         "l_inf_threshold": l_inf_max,
         "l2_threshold": l2_max,
+        "collision_filter": collision_filter,
         "total_rows": total_rows,
         "hash_collisions": int(len(hash_collisions)),
         "hash_collision_rate_percent": collision_rate(len(hash_collisions), total_rows),
@@ -184,6 +203,49 @@ def make_summary(
                 row[column] = float(values[0])
 
     return pd.DataFrame([row])
+
+
+def write_readable_summary(summary: pd.DataFrame, output_path: Path) -> None:
+    row = summary.iloc[0]
+    lines = [
+        "# L2 Collision Analysis Summary",
+        "",
+        f"- Collision filter: {row['collision_filter']}",
+        f"- Total rows: {int(row['total_rows'])}",
+        f"- Collision rows: {int(row['filtered_collisions'])}",
+        f"- Collision rate: {row['filtered_collision_rate_percent']:.2f}%",
+        "",
+        "## Thresholds",
+        "",
+        f"- final_hash_l1 <= {row['final_hash_l1_threshold']:g}",
+        f"- l_inf <= {row['l_inf_threshold']:g}",
+        f"- l2 <= {row['l2_threshold']:g}",
+        "",
+        "## Means For Collision Rows",
+        "",
+        f"- Mean l_inf: {row['mean_l_inf_filtered_collisions']:.6f}",
+        f"- Mean l2: {row['mean_l2_filtered_collisions']:.6f}",
+        f"- Mean steps: {row['mean_steps_filtered_collisions']:.2f}",
+        "",
+        "## Means For All Rows",
+        "",
+        f"- Mean l_inf: {row['mean_L_inf_all_rows']:.6f}",
+        f"- Mean l2: {row['mean_l2_all_rows']:.6f}",
+        "",
+        "## Additional Counts",
+        "",
+        f"- Hash collisions only: {int(row['hash_collisions'])} ({row['hash_collision_rate_percent']:.2f}%)",
+        f"- Hash + l_inf collisions: {int(row['hash_and_l_inf_collisions'])} "
+        f"({row['hash_and_l_inf_collision_rate_percent']:.2f}%)",
+        f"- Hash + l2 collisions: {int(row['hash_and_l2_collisions'])} "
+        f"({row['hash_and_l2_collision_rate_percent']:.2f}%)",
+    ]
+
+    for column in ["pgd_step_size", "l2_budget"]:
+        if column in row and pd.notna(row[column]):
+            lines.insert(3, f"- {column}: {row[column]:g}")
+
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def make_threshold_curve(
@@ -232,29 +294,41 @@ def main() -> None:
         if default_l2 is None:
             raise ValueError("Could not infer --l2-max. Pass --l2-max explicitly.")
         args.l2_max = default_l2
-    collisions = filter_collisions(df, args.final_hash_l1_max, args.l_inf_max, args.l2_max)
-    summary = make_summary(df, collisions, args.final_hash_l1_max, args.l_inf_max, args.l2_max)
+    if args.successes:
+        collisions = filter_success_rows(df)
+        collision_filter = "success == True"
+    else:
+        collisions = filter_collisions(df, args.final_hash_l1_max, args.l_inf_max, args.l2_max)
+        collision_filter = "final_hash_l1/l_inf/l2 thresholds"
 
-    summary_path = args.output_dir/ f"l2_collision_summary_l2max_{args.l2_max}_linf_{args.l_inf_max}.csv"
+    summary = make_summary(df, collisions, args.final_hash_l1_max, args.l_inf_max, args.l2_max, collision_filter)
 
-    summary.to_csv(summary_path, index=False)
+    summary_kind = "successes" if args.successes else "thresholds"
+    readable_summary_path = args.output_dir / f"l2_collision_summary_{summary_kind}_l2max_{args.l2_max}_linf_{args.l_inf_max}.md"
+
+    write_readable_summary(summary, readable_summary_path)
 
 
     print(f"\nLoaded rows: {len(df)}")
     print(
         "Collision definition: "
-        f"final_hash_l1 <= {args.final_hash_l1_max:g}, "
-        f"l_inf <= {args.l_inf_max:g}, "
-        f"l2 <= {args.l2_max:g}"
+        f"{collision_filter}"
     )
-    print(f"Filtered collisions: {len(collisions)}/{len(df)}")
+    if not args.successes:
+        print(
+            "Thresholds: "
+            f"final_hash_l1 <= {args.final_hash_l1_max:g}, "
+            f"l_inf <= {args.l_inf_max:g}, "
+            f"l2 <= {args.l2_max:g}"
+        )
+    print(f"Collision rows: {len(collisions)}/{len(df)}")
     print(f"Original data collided: {collision_rate(len(collisions), len(df)):.2f}%")
     print(f"Mean l_inf of filtered collisions: {summary.loc[0, 'mean_l_inf_filtered_collisions']:.6f}")
     print(f"Mean l2 of filtered collisions: {summary.loc[0, 'mean_l2_filtered_collisions']:.6f}")
     print(f"Mean l_inf of all rows: {summary.loc[0, 'mean_L_inf_all_rows']:.6f}")   
     print(f"Mean l2 of all rows: {summary.loc[0, 'mean_l2_all_rows']:.6f}")
     print(f"Mean steps of filtered collisions: {summary.loc[0, 'mean_steps_filtered_collisions']:.2f}")
-    print(f"Wrote summary: {summary_path}")
+    print(f"Wrote readable summary: {readable_summary_path}")
 
 
 if __name__ == "__main__":
