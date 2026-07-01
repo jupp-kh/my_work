@@ -106,14 +106,14 @@ class ImageSaveLimiter:
         self.saved = 0
         self.lock = threading.Lock()
 
-    def should_save(self):
-        if self.limit < 0:
-            return True
+    def reserve(self):
+        if self.limit == 0:
+            return None
         with self.lock:
-            if self.saved >= self.limit:
-                return False
+            if self.limit > 0 and self.saved >= self.limit:
+                return None
             self.saved += 1
-            return True
+            return self.saved
 
 
 def optimization_thread(
@@ -145,10 +145,13 @@ def optimization_thread(
 
         # Store and reload source image to avoid image changes due to different formats
         source = load_and_preprocess_img(img, device, "coco")
-        input_file_name = Path(img).stem
-        save_example = args.output_folder != "" and image_save_limiter.should_save()
-        if save_example:
-            save_images(source, args.output_folder, f"{input_file_name}")
+        example_index = image_save_limiter.reserve() if args.output_folder != "" else None
+        example_dir = None
+        if example_index is not None:
+            example_dir = Path(args.output_folder) / f"example_{example_index:06d}"
+            example_dir.mkdir(parents=True, exist_ok=True)
+            save_images(source, str(example_dir), "source")
+            save_images(target_tensor, str(example_dir), "target")
         source_orig = source.clone()
         delta = torch.zeros_like(source, requires_grad=True)
 
@@ -210,15 +213,9 @@ def optimization_thread(
                                 f"Finishing after {i + 1} steps - L2 distance: {l2_distance:.4f} - L-Inf distance: {linf_distance:.4f}"
                             )
 
-                            if save_example:
-                                save_images(
-                                    source + delta,
-                                    args.output_folder,
-                                    f"{input_file_name}_opt_{linf_distance:.4f}",
-                                )
-                                save_images(
-                                    delta, args.output_folder, f"{input_file_name}_delta"
-                                )
+                            if example_dir is not None:
+                                save_images(source + delta, str(example_dir), "adversarial")
+                                save_images(delta, str(example_dir), "delta")
                             logger_data = [
                                 img,
                                 target_path,
@@ -241,13 +238,9 @@ def optimization_thread(
                 l2_distance = torch.norm(current_img - source_orig, p=2)
                 linf_distance = torch.norm(current_img - source_orig, p=float("inf"))
                 success = final_hash_l1 < theshold
-            if success and save_example:
-                save_images(
-                    source + delta,
-                    args.output_folder,
-                    f"{input_file_name}_opt_{linf_distance:.4f}",
-                )
-                save_images(delta, args.output_folder, f"{input_file_name}_delta")
+            if example_dir is not None:
+                save_images(source + delta, str(example_dir), "adversarial")
+                save_images(delta, str(example_dir), "delta")
             logger.add_line(
                 [
                     img,
