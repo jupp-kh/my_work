@@ -1,11 +1,13 @@
 import argparse
 import concurrent.futures
 import csv
+import re
 import random
 import shutil
 import sys
 import threading
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 warnings.filterwarnings("ignore")
@@ -116,6 +118,97 @@ class ImageSaveLimiter:
             return self.saved
 
 
+def filename_stem(path):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(path).stem)
+
+
+def save_successful_example(
+    output_folder,
+    image_save_limiter,
+    source_path,
+    target_path,
+    source,
+    target,
+    adversarial,
+    delta,
+):
+    if output_folder == "":
+        return
+
+    example_index = image_save_limiter.reserve()
+    if example_index is None:
+        return
+
+    example_dir = Path(output_folder) / f"example_{example_index:06d}"
+    example_dir.mkdir(parents=True, exist_ok=True)
+    source_prefix = filename_stem(source_path)
+    target_prefix = filename_stem(target_path)
+    save_images(source, str(example_dir), f"{source_prefix}_source")
+    save_images(target, str(example_dir), f"{target_prefix}_target")
+    save_images(adversarial, str(example_dir), f"{source_prefix}_adversarial")
+    save_images(delta, str(example_dir), f"{source_prefix}_delta")
+
+
+def format_metric(value):
+    if pd.isna(value):
+        return "N/A"
+    return f"{value:.6f}"
+
+
+def write_markdown_summary(args, df, log_file):
+    df["l2"] = df["l2"].astype(float)
+    df["l_inf"] = df["l_inf"].astype(float)
+    df["steps"] = df["steps"].astype(int)
+    df["success"] = df["success"].astype(str).str.lower() == "true"
+
+    total_attacks = len(df)
+    successful_attacks = int(df["success"].sum())
+    success_percent = (successful_attacks / total_attacks * 100) if total_attacks else 0.0
+    successful_df = df[df["success"]]
+
+    mean_l2 = successful_df["l2"].mean()
+    mean_linf = successful_df["l_inf"].mean()
+    mean_steps = successful_df["steps"].mean()
+    projection_metric = "l_inf" if args.projection == "linf" else "l2"
+    epsilon = df[projection_metric].max() if total_attacks else np.nan
+
+    summary_file = Path(args.output_folder) / f"{args.projection}.md"
+    summary_file.write_text(
+        "\n".join(
+            [
+                f"# Collision Attack Summary - {args.projection}",
+                "",
+                f"- Projection method: `{args.projection}`",
+                f"- Log file: `{log_file}`",
+                f"- Total attacks: {total_attacks}",
+                f"- Successful attacks: {successful_attacks}",
+                f"- Percent successfully attacked: {success_percent:.2f}%",
+                f"- Epsilon measured by `{projection_metric}`: {format_metric(epsilon)}",
+                f"- learning_rate: {args.learning_rate}",
+                f"- optimizer: {args.optimizer}",
+                "",
+                "## Means for Successful Attacks Only",
+                "",
+                "| Parameter | Mean |",
+                "| --- | ---: |",
+                f"| steps | {format_metric(mean_steps)} |",
+                f"| l_inf | {format_metric(mean_linf)} |",
+                f"| l2 | {format_metric(mean_l2)} |",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    print(f"l2 mean successful: {format_metric(mean_l2)}")
+    print(f"l_inf mean successful: {format_metric(mean_linf)}")
+    print(f"steps mean successful: {format_metric(mean_steps)}")
+    print(
+        f"===>Collision Rate under {projection_metric}={format_metric(epsilon)}: {success_percent}%"
+    )
+    print(f"Saved markdown summary to {summary_file}")
+
+
 def optimization_thread(
     url_list,
     device,
@@ -145,13 +238,6 @@ def optimization_thread(
 
         # Store and reload source image to avoid image changes due to different formats
         source = load_and_preprocess_img(img, device, "coco")
-        example_index = image_save_limiter.reserve() if args.output_folder != "" else None
-        example_dir = None
-        if example_index is not None:
-            example_dir = Path(args.output_folder) / f"example_{example_index:06d}"
-            example_dir.mkdir(parents=True, exist_ok=True)
-            save_images(source, str(example_dir), "source")
-            save_images(target_tensor, str(example_dir), "target")
         source_orig = source.clone()
         delta = torch.zeros_like(source, requires_grad=True)
 
@@ -181,7 +267,11 @@ def optimization_thread(
                 f"{args.optimizer} is no valid optimizer class. Please select --optimizer out of [Adam, SGD]"
             )
 
-        for i in tqdm(range(1000)):
+        iteration_range = range(1000)
+        if not args.disable_progress_bar:
+            iteration_range = tqdm(iteration_range)
+
+        for i in iteration_range:
             outputs_source = model(normalize(source + delta, "coco"))
             target_loss = l2_loss(outputs_source, target_hash)
             total_loss = target_loss
@@ -213,9 +303,16 @@ def optimization_thread(
                                 f"Finishing after {i + 1} steps - L2 distance: {l2_distance:.4f} - L-Inf distance: {linf_distance:.4f}"
                             )
 
-                            if example_dir is not None:
-                                save_images(source + delta, str(example_dir), "adversarial")
-                                save_images(delta, str(example_dir), "delta")
+                            save_successful_example(
+                                args.output_folder,
+                                image_save_limiter,
+                                img,
+                                target_path,
+                                source,
+                                target_tensor,
+                                source + delta,
+                                delta,
+                            )
                             logger_data = [
                                 img,
                                 target_path,
@@ -238,9 +335,17 @@ def optimization_thread(
                 l2_distance = torch.norm(current_img - source_orig, p=2)
                 linf_distance = torch.norm(current_img - source_orig, p=float("inf"))
                 success = final_hash_l1 < theshold
-            if example_dir is not None:
-                save_images(source + delta, str(example_dir), "adversarial")
-                save_images(delta, str(example_dir), "delta")
+            if success:
+                save_successful_example(
+                    args.output_folder,
+                    image_save_limiter,
+                    img,
+                    target_path,
+                    source,
+                    target_tensor,
+                    source + delta,
+                    delta,
+                )
             logger.add_line(
                 [
                     img,
@@ -310,9 +415,14 @@ def main():
         "--save_examples",
         default=0,
         type=int,
-        help="Number of attempted examples to save as images. Use 0 to disable image saving, -1 to save all.",
+        help="Number of successful examples to save as images. Defaults to -1 to save all. Use 0 to disable image saving.",
     )
     parser.add_argument("--edges_only", dest="edges_only", action="store_true", help="Change only pixels of edges")
+    parser.add_argument(
+        "--disable_progress_bar",
+        action="store_true",
+        help="Disable tqdm progress bars for faster, quieter runs.",
+    )
     parser.add_argument(
         "--sample_limit",
         dest="sample_limit",
@@ -323,7 +433,7 @@ def main():
     parser.add_argument(
         "--threads",
         dest="num_threads",
-        default=1,
+        default=30,
         type=int,
         help="Number of parallel threads",
     )
@@ -334,7 +444,7 @@ def main():
         type=int,
         help="Hash change interval checking",
     )
-    parser.add_argument("--epsilon", default=16.0 / 255, type=float)
+    parser.add_argument("--epsilon", default=8.0 / 255, type=float)
     parser.add_argument(
         "--projection",
         choices=["linf", "l2"],
@@ -347,6 +457,7 @@ def main():
     model_path = str(Path(args.model_path).expanduser().resolve())
     # Load and prepare components
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
     dataset_root = Path(args.source).expanduser()
     if dataset_root.is_file():
@@ -362,8 +473,10 @@ def main():
             if not any(output_folder.iterdir()):
                 print(f"Folder {output_folder} already exists and is empty.")
             else:
-                print(f"Folder {output_folder} already exists and is not empty, delete it")
-                shutil.rmtree(output_folder)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_folder = output_folder.with_name(f"{output_folder.name}_backup_{timestamp}")
+                print(f"Folder {output_folder} already exists and is not empty, moving it to {backup_folder}")
+                shutil.move(str(output_folder), str(backup_folder))
                 output_folder.mkdir(parents=True)
         args.output_folder = str(output_folder)
 
@@ -378,7 +491,7 @@ def main():
         "l_inf",
         "steps",
     ]
-    logger = Logger(args.experiment_name, logging_header, output_dir=str(Path(args.output_folder) / "logs"))
+    logger = Logger(f"{args.projection}_{args.experiment_name}", logging_header, output_dir=str(Path(args.output_folder) / "logs"))
 
     # Load images
     source = Path(args.source).expanduser()
@@ -412,23 +525,12 @@ def main():
     """
     Statistic
     """
-    log_file = Path(args.output_folder) / "logs" / f"{args.experiment_name}.csv"
+    log_file = Path(args.output_folder) / "logs" / f"{args.projection}_{args.experiment_name}.csv"
     df = pd.read_csv(log_file, skiprows=1)
-    if not df.empty:
-        df["l2"] = df["l2"].astype(float)
-        df["l_inf"] = df["l_inf"].astype(float)
-        df["steps"] = df["steps"].astype(int)
-        df["success"] = df["success"].astype(str).str.lower() == "true"
-        print(f'l2: {df["l2"].mean()}')
-        print(f'l_inf: {df["l_inf"].mean()}')
-        print(f'steps: {df["steps"].mean()}')
-        projection_metric = "l_inf" if args.projection == "linf" else "l2"
-        epsilon = "{:.4f}".format(max(df[projection_metric]))
-        print(
-            f"===>Collision Rate under {projection_metric}={epsilon}: {(df['success'].mean() * 100)}%"
-        )
+    if df.empty:
+        print("No attacks were logged.")
     else:
-        print("No successful collisions were logged.")
+        write_markdown_summary(args, df, log_file)
 
 
 if __name__ == "__main__":
