@@ -1,0 +1,11 @@
+diffusers>=0.27.0
+transformers
+accelerate
+safetensors
+torch>=2.2.0
+torchvision
+tensorboard
+numpy
+Pillow
+tqdm
+

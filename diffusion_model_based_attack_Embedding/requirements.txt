@@ -1,0 +1,9 @@
+accelerate
+diffusers
+numpy
+pillow
+protobuf
+tensorboard
+torch
+transformers
+safetensors
